@@ -5,7 +5,7 @@ Personal site — a Hugo blog published to GitHub Pages.
 ## Structure
 
 - `content/posts/` — write-ups and posts (Markdown)
-- `themes/hello-friend/` — vendored theme ([hello-friend](https://github.com/panr/hugo-theme-hello-friend), MIT)
+- `themes/bluejay/` — **our own theme**, written from scratch: terminal chrome (prompt header, blinking cursor, mono signals) + card-list reading layout, light-blue signaling. Plain CSS — the palette block at the top of `themes/bluejay/assets/css/main.css` is the whole color system
 - `.github/workflows/hugo.yaml` — builds and deploys to Pages on push to `main`
 
 ## Writing a post
@@ -33,5 +33,5 @@ hugo server -D
 
 ## License
 
-Content is copyright the author. The vendored theme carries its own MIT license
-(`themes/hello-friend/LICENSE.md`).
+Content is copyright the author. The bluejay theme is original and MIT-licensed
+(`themes/bluejay/LICENSE`).

@@ -1,0 +1,9 @@
+name = "bluejay"
+license = "MIT"
+licenselink = "LICENSE"
+description = "Original theme for rhettjay.github.io — terminal chrome (prompt header, blinking cursor, mono signals) merged with a card-list reading layout, in light-blue terminal signaling. Plain CSS, no build magic."
+tags = ["blog", "terminal", "minimal", "dark", "light"]
+min_version = "0.128.0"
+
+[author]
+  name = "rhettjay"

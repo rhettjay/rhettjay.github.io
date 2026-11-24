@@ -1,0 +1,23 @@
+{{ define "main" }}
+<div class="shell">
+  <h1 class="page-title mono">{{ .Title }}</h1>
+  {{ with .Content }}<div class="page-content">{{ . }}</div>{{ end }}
+  <section class="post-list">
+    {{ range .Pages.ByDate.Reverse }}
+      <article class="card">
+        <a class="card-title" href="{{ .RelPermalink }}">{{ .Title }}</a>
+        <div class="card-summary">{{ .Summary | plainify }}</div>
+        <div class="card-meta mono">
+          <time datetime="{{ .Date.Format "2006-01-02" }}">{{ .Date.Format "2006-01-02" }}</time>
+          <span>{{ .ReadingTime }} min read</span>
+          {{ with .Params.tags }}
+            <span class="card-tags">
+              {{ range . }}<a href="{{ "tags/" | relURL }}{{ . | urlize }}">#{{ . }}</a>{{ end }}
+            </span>
+          {{ end }}
+        </div>
+      </article>
+    {{ end }}
+  </section>
+</div>
+{{ end }}

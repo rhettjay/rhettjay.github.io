@@ -1,0 +1,13 @@
+<header class="site-header">
+  <div class="shell header-row">
+    <a class="prompt" href="{{ .Site.Home.RelPermalink }}">
+      <span class="prompt-user">{{ .Site.Params.prompt | default "rhettjay@web" }}</span><span class="prompt-sep">:</span><span class="prompt-path">~</span><span class="prompt-dollar">$</span><span class="cursor" aria-hidden="true"></span>
+    </a>
+    <nav class="site-nav" aria-label="Site">
+      <a href="{{ .Site.Home.RelPermalink }}">~/home</a>
+      <a href="{{ "posts/" | relURL }}">~/posts</a>
+      <a href="{{ "tags/" | relURL }}">~/tags</a>
+    </nav>
+    <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle light or dark theme" title="toggle theme">◐</button>
+  </div>
+</header>

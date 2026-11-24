@@ -1,0 +1,33 @@
+{{ define "main" }}
+<div class="shell">
+  {{ with .Site.Params.subtitle }}
+    <p class="site-subtitle mono muted">{{ . }}</p>
+  {{ end }}
+  {{ $pages := where site.RegularPages "Type" "posts" }}
+  {{ $paginator := .Paginate $pages }}
+  <section class="post-list">
+    {{ range $paginator.Pages }}
+      <article class="card">
+        <a class="card-title" href="{{ .RelPermalink }}">{{ .Title }}</a>
+        <div class="card-summary">{{ .Summary | plainify }}</div>
+        <div class="card-meta mono">
+          <time datetime="{{ .Date.Format "2006-01-02" }}">{{ .Date.Format "2006-01-02" }}</time>
+          <span>{{ .ReadingTime }} min read</span>
+          {{ with .Params.tags }}
+            <span class="card-tags">
+              {{ range . }}<a href="{{ "tags/" | relURL }}{{ . | urlize }}">#{{ . }}</a>{{ end }}
+            </span>
+          {{ end }}
+        </div>
+      </article>
+    {{ end }}
+  </section>
+  {{ if gt $paginator.TotalPages 1 }}
+    <nav class="pager mono muted" aria-label="Pages">
+      {{ if $paginator.HasPrev }}<a href="{{ $paginator.Prev.URL }}">&larr; prev</a>{{ end }}
+      <span>page {{ $paginator.PageNumber }} / {{ $paginator.TotalPages }}</span>
+      {{ if $paginator.HasNext }}<a href="{{ $paginator.Next.URL }}">next &rarr;</a>{{ end }}
+    </nav>
+  {{ end }}
+</div>
+{{ end }}
