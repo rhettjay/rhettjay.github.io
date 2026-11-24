@@ -1,21 +1,29 @@
 ---
-title: "KubeCon NA 2026 CTF Writeup"
+title: "KubeCon NA 2026 CTF: six flags, two hours, one swarm"
 date: 2026-11-13T07:00:00-07:00
 tags: ["security", "kubernetes", "ctf", "kubecon"]
 toc: true
 ---
 
-Another KubeCon, another set of three challenges from [ControlPlane](https://ctf.control-plane.io/). KubeCon NA 2026 brought the usual KubeSim formula: an SSH bundle per challenge, a fresh short-lived cluster, a deliberately split set of RBAC permissions, and flags hidden behind the exact misconfigurations the theme advertises. Three challenges, eight flags, 210 points on the board.
+Two hours inside ControlPlane's KubeCon NA 2026 CTF produced six of eight flags — 130 of 210 points, first solve on the board for both flags of the second challenge — and an honest miss on the last two, which outlasted the clock somewhere inside a network-policy puzzle. This write-up is reconstructed the way the run actually happened: from a timestamped evidence log, not from memory. Every command and output below is pasted from captured evidence; the interpretation came afterward, which is the only honest order to do it in.
 
-We finished **6 of 8 flags (130 points), holding #1 on the scoreboard at our last pull**, with both flags of the second challenge as first solves board-wide. The two broker flags on the third challenge outlasted our window — the full story of that hunt is included below, dead ends and all, since a write-up that only shows the wins teaches the wrong half of the trade.
+> **Spoilers** for six of the eight flags, plus a detailed map of where the other two live.
 
-> **Spoiler warning:** full solutions for six of the eight flags, plus a detailed map of where the other two live.
+"We" needs a word of explanation up front: the run was executed by an agent swarm — one orchestrator/judge session and rotating fresh-context LLM workers — under my supervision. The challenge mechanics below stand on their own; the orchestration gets its own section near the end.
 
-One note on "we": this run was executed by an AI agent swarm — one orchestrator/judge session and a rotating cast of fresh-context worker agents — that I supervised and steered. The challenge mechanics below stand on their own; the swarm gets its own section at the end for anyone curious how the sausage was made.
+## The run at a glance
 
-## Challenge 1 — open-gates
+| Challenge | Theme | Flags | Points | First flag | Closed |
+|---|---|---|---|---|---|
+| open-gates | Gateway API | 3/3 | 50/50 | 18:37Z | 18:50Z |
+| two-wrongs-make-a-route | Calico + Istio | 2/2 | 60/60 | 19:02Z | 19:07Z — both first solves board-wide |
+| do-not-spill-the-honey | Cilium + deception | 1/3 | 20/100 | 19:33Z | window closed 20:33Z |
 
-SSHing into the first bundle drops you at a root shell on `jumpbox`, with this banner:
+Three constraints we held ourselves to, because they shaped everything below: a flag only counted once its exact string appeared in a raw evidence file; no paid hints (55 points of them went unbought on principle); and each challenge had exactly one mutation owner, with everything else read-only.
+
+## Case file 1 — open-gates
+
+The first bundle's banner, captured at 18:36Z:
 
 ```text
    ___  ____  _____ _   _    ____    _  _____ _____ ____
@@ -52,41 +60,17 @@ SSHing into the first bundle drops you at a root shell on `jumpbox`, with this b
   Good luck!
 ```
 
-A Gateway API challenge wearing a platform-engineering costume. Before touching anything, run the universal opening that every one of these CTFs rewards:
+**What the permissions said before we touched anything.** The landing namespaces are `frontend`, `backend`, `internal`, and `envoy-gateway-system`, and the per-namespace `kubectl auth can-i --list` pass — not just the cluster-scoped one — revealed a split so deliberate it was practically a design document:
 
-```shell
-kubectl auth whoami
-kubectl auth can-i --list
-# and critically, per namespace:
-kubectl auth can-i --list -n frontend
-kubectl auth can-i --list -n backend
-kubectl auth can-i --list -n internal
-kubectl auth can-i --list -n envoy-gateway-system
-```
-
-The per-namespace pass is where the challenge lives. Our permissions split deliberately:
-
-- **`backend`**: full verbs on `httproutes` (Gateway API)
-- **`internal`**: full verbs on `referencegrants`
+- `backend`: full verbs on `httproutes`
+- `internal`: full verbs on `referencegrants`
 - everywhere else: read-only
 
-So the shape of the intended solve is already legible from RBAC alone: we create routes in `backend`, and we mint cross-namespace trust from `internal`.
+Routing state at landing: one Gateway (`eg`, in `frontend`) with `allowedRoutes: All`; one HTTPRoute already sending `/` and `/admin` to the frontend app; zero ReferenceGrants. Network policy sealed the jumpbox off from the app namespaces but admitted `envoy-gateway-system` into all of them. So the Gateway was the only door into the apps — and the RBAC split had already told us which two keys we'd been handed.
 
-Reading the routing state:
+### 18:37Z — the first flag cost one probe
 
-```shell
-kubectl get gateway -A -o yaml        # one Gateway "eg" in frontend, allowedRoutes: All
-kubectl get httproute -A              # one route: frontend serves / and /admin → frontend:80
-kubectl get referencegrant -A         # zero
-```
-
-One Gateway (`eg` in `frontend`) that allows routes to attach from **all namespaces** — remember that. One existing HTTPRoute sending `/` and `/admin` to the frontend app on port 80. Zero ReferenceGrants, which matters for the third flag.
-
-Network policy says the jumpbox cannot reach the app namespaces directly — but the `envoy-gateway-system` namespace can reach all of them. The Gateway is the only door.
-
-### Flag 1 — who left admin exposed
-
-The recon-then-obvious-probe pattern: the existing route already forwards `/admin` to the frontend app, and the Gateway's ClusterIP is reachable from the jumpbox. The route is bound to hostname `hello.k8s.ctf`, so send that Host header:
+The existing route already matched `/admin`, the Gateway's ClusterIP was reachable from the jumpbox, and the route was bound to hostname `hello.k8s.ctf`. Send the Host header, collect:
 
 ```shell
 curl -s -H 'Host: hello.k8s.ctf' http://10.108.29.148/admin
@@ -98,22 +82,22 @@ curl -s -H 'Host: hello.k8s.ctf' http://10.108.29.148/admin
 }
 ```
 
-The platform team migrated to Gateway API and routed their own admin page through the front door. Ten points for one curl.
+The platform team had routed their own admin page through the public front door. Ten points, one request, zero permissions spent.
 
-### Flag intel — the apps leak their own source
+### The endpoint map was already in the pod specs
 
-The next two flags need to know *where* to route. Here's the recon finding that saved us the most time: **full pod specs contain the apps' embedded Python source**. The apps are `BaseHTTPRequestHandler` one-pagers baked into the pod spec as a `command:`, so pulling each pod individually (`kubectl get pod -n backend backend-api-... -o yaml`) hands you the complete endpoint map:
+Before routing anywhere new, we needed to know what to route *to* — and the answer was sitting in plain sight. Each app is a Python one-pager baked into its pod spec as a `command:`, so pulling pods individually (`kubectl get pod -n backend <pod> -o yaml`) returns the full source:
 
 - `backend-api` serves `/flag-2`
 - `payments-api` (in `internal`) serves `/flag-3`
 - both read the `ctf-flag` secret mounted at `/run/secrets`
 - the frontend app serves `/`, `/status`, `/admin`
 
-One caution from experience: a bulk `kubectl get pods -A -o yaml` truncates at the CLI's output limit and silently loses the embedded source — pull the pods individually.
+One caveat from the log: a bulk `kubectl get pods -A -o yaml` truncates at the CLI's output limit and silently drops the embedded source. Pull pods individually.
 
-### Flag 2 — speak httproute and enter
+### 18:48Z — a route in `backend`
 
-We have full verbs on `httproutes` in `backend`, and the Gateway accepts attach from all namespaces. Create a route in `backend` whose `parentRef` points at the Gateway in `frontend`, match on `/backend`, rewrite the prefix, and send traffic to `backend-api`:
+Attach an HTTPRoute to the Gateway from the namespace where we hold route verbs. Cross-namespace `parentRef` is fine because the Gateway accepts attach from all namespaces; the `backendRef` is same-namespace, so no grant is needed:
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1
@@ -155,9 +139,9 @@ curl -s -H 'Host: hello.k8s.ctf' http://10.108.29.148/backend/flag-2
 }
 ```
 
-### Flag 3 — permission to cross granted
+### 18:49Z — a grant in `internal`, negative first
 
-Same shape, but the `backendRef` now points at `payments-api` **in the `internal` namespace**. This is where Gateway API's cross-namespace model bites: routes may attach to Gateways in other namespaces (governed by `allowedRoutes`), but a `backendRef` into another namespace requires a `ReferenceGrant` *from that namespace*. With no grant, the route is accepted but its refs don't resolve:
+Pointing the same shape at `payments-api` — a Service in `internal` — trips Gateway API's second trust boundary. The route attaches fine, but its backend reference won't resolve:
 
 ```shell
 kubectl get httproute ctf-payments-route -n backend -o jsonpath='{.status}'
@@ -171,7 +155,7 @@ kubectl get httproute ctf-payments-route -n backend -o jsonpath='{.status}'
 ]}]}
 ```
 
-That negative is the proof the gate is real. Now spend the second half of the permission split — `referencegrants` full verbs in `internal`:
+That refusal is the proof the gate is real, and it names the fix. Spend the second key — `referencegrants` full verbs in `internal`:
 
 ```yaml
 apiVersion: gateway.networking.k8s.io/v1beta1
@@ -190,7 +174,7 @@ spec:
     name: payments-api
 ```
 
-The route's `ResolvedRefs` condition flips to `True`, and the same curl lands:
+`ResolvedRefs` flips to `True`, and the same curl through the Gateway lands:
 
 ```shell
 curl -s -H 'Host: hello.k8s.ctf' http://10.108.29.148/payments/flag-3
@@ -202,15 +186,15 @@ curl -s -H 'Host: hello.k8s.ctf' http://10.108.29.148/payments/flag-3
 }
 ```
 
-Challenge complete: 50/50. The two flags are a neat little tour of Gateway API's two trust boundaries — attachment (`allowedRoutes` on the Gateway) and reference (`ReferenceGrant` in the target namespace).
+Mechanically, the three flags are a clean tour of Gateway API's two cross-namespace boundaries: who may *attach* to a Gateway (`allowedRoutes` — this one said everybody) and who may *reference* into a namespace (`ReferenceGrant` — held by the namespace being referenced). The challenge hands you write access in exactly the namespaces that matter for each hop.
 
-### Bonus recon surface
+### Also in the log
 
-Not needed for flags, but worth knowing: the Envoy data-plane pods expose **unauthenticated Prometheus metrics on port 19001**, and the metrics leak the full programmed route topology (cluster names like `httproute/backend/ctf-backend-route` show up as soon as routes exist). If you can reach the Envoy pods, you can read the routing table.
+The Envoy data-plane pods expose unauthenticated Prometheus metrics on port 19001, and the metric names leak the programmed route topology (cluster names like `httproute/backend/ctf-backend-route`). Recon gold if you can reach the Envoy pods; no flag required it.
 
-## Challenge 2 — two-wrongs-make-a-route
+## Case file 2 — two-wrongs-make-a-route
 
-The second bundle is a fresh cluster — new bastion, ~20 minutes old. You land as `root@dev` in the `dev` namespace:
+The second bundle is a fresh cluster, about twenty minutes old at landing:
 
 ```text
     +-------------------+       +-------------------+
@@ -230,21 +214,20 @@ permissions granted to your account.
 Retrieve both flags.
 ```
 
-Istio (1.31.4) + Flux + Calico. The target is the `platform/api` pod — a Python app whose source, again, is embedded verbatim in the pod spec: `GET /` returns flag 1, `GET /admin/config` returns flag 2. It's reachable at `api.platform.svc.cluster.local:8080`.
+Landing identity: `root@dev`, service account `system:serviceaccount:dev:dev`, in a cluster running Istio 1.31.4, Flux, and Calico.
 
-Recon turns up exactly two gates in front of it, both readable:
+**Target and gates, as recon established them:**
 
-**Gate 1 — Calico.** NetworkPolicy `platform/allow-tcp-8080` allows ingress to the api pod on TCP 8080 **only from namespaces labeled `k8s.ctf/trusted=true`**. Exactly one namespace carries the label: `production`.
+- the target is `platform/api` — Python, source embedded in the pod spec: `GET /` returns flag 1, `GET /admin/config` returns flag 2 — at `api.platform.svc.cluster.local:8080`
+- **Gate 1, Calico:** NetworkPolicy `platform/allow-tcp-8080` permits ingress to the api pod on TCP 8080 only from namespaces labeled `k8s.ctf/trusted=true`. Exactly one namespace carries the label: `production`
+- **Gate 2, Istio:** AuthorizationPolicy `platform/api-admin` is a `DENY` on `/admin` and `/admin/*`, port 8080, for everyone except service account `production/admin-client`
+- our RBAC: read-only broadly, plus exactly one write — patch/update on Namespace `dev` and nothing else (ClusterRole `edit-dev-ns`, `resourceNames: [dev]`)
 
-**Gate 2 — Istio.** AuthorizationPolicy `platform/api-admin` is a `DENY` on paths `/admin` and `/admin/*`, port 8080, for everyone **except** service account `production/admin-client`.
+A parsing lesson the log paid for: dump RBAC rule blocks verbatim before interpreting them. A quick regex pass initially attributed Flux write permissions to us that actually belonged to an aggregated `edit` ClusterRole nobody had bound to our account. One direct `kubectl auth can-i create gitrepositories.fluxcd.io` — answer: no — killed the misparse before anything was built on it.
 
-And our RBAC, dumped verbatim: read-only broadly, plus exactly **one write** — patch/update on Namespace `dev` and nothing else (`edit-dev-ns` ClusterRole, `resourceNames: [dev]`).
+### 19:01Z — wrong the first: a trust label the tenant can set
 
-A lesson we paid for in miniature: dump the RBAC rule blocks **verbatim** before parsing them. A quick regex pass initially attributed Flux write permissions to us that actually belonged to an aggregated `edit` ClusterRole nobody bound to our account — a direct `kubectl auth can-i create gitrepositories.fluxcd.io` (answer: no) killed the misparse before anything was built on it.
-
-### Flag 1 — trust me i set the label
-
-Look at the Calico gate again: it trusts a *namespace label*. And we hold `patch namespace/dev`. The gate is self-service:
+Read Gate 1 again. It trusts a *namespace label*. We hold `patch namespace/dev`. Those two sentences are the whole flag:
 
 ```shell
 kubectl label ns dev k8s.ctf/trusted=true
@@ -257,13 +240,13 @@ curl -s http://api.platform.svc.cluster.local:8080/
 }
 ```
 
-First wrong: the network policy trusts an attribute the tenant can set on itself. The flag name says the organizers agree.
+A network policy keyed on an attribute the guarded tenant controls is a door with the key taped to it. The flag name suggests the organizers knew.
 
-That gets us to the app, but `/admin/config` still returns `403 RBAC: access denied` from the Envoy rbac filter (`server: istio-envoy` in the response headers). We can't create pods in `production`, can't mint `production/admin-client` identity, can't exec anywhere. So the second flag has to be a bypass of the DENY itself — a request-shape trick.
+`/admin/config` still answered `403 RBAC: access denied` from the Envoy rbac filter (`server: istio-envoy` on the response). No route to the exempt identity existed — no pod creation, no token minting, no exec — so flag 2 had to be a bypass of the DENY itself, in request shape.
 
-### Flag 2 — slashes tell two stories
+### 19:06Z — wrong the second: two path stories
 
-The primary worker swept 26 path variants with `--path-as-is` (never let curl normalize for you). Condensed:
+The mutation owner swept 26 path variants with `--path-as-is` (never let the client normalize for you). The condensed results:
 
 | Path (`--path-as-is`) | Result |
 |---|---|
@@ -294,23 +277,21 @@ curl -si --path-as-is http://api.platform.svc.cluster.local:8080//admin/config
 }
 ```
 
-The mechanism is a path-normalization differential between three layers:
+Three layers, in the order the request passes them:
 
-1. **Istio/Envoy RBAC** evaluates the **raw** `:path`. `//admin/config` does not prefix-match `/admin` or `/admin/*` (it starts with `//`), so the DENY rule's path condition never fires.
-2. **Envoy's default `merge_slashes: true`** then normalizes the path *before forwarding upstream* — the app receives `/admin/config`.
-3. The app does a strict `urlsplit(self.path).path == "/admin/config"` comparison, which now matches.
+1. **Istio/Envoy RBAC** matches on the raw `:path`. `//admin/config` does not prefix-match `/admin` or `/admin/*` — it starts with `//` — so the DENY rule's path condition never fires.
+2. **Envoy's default `merge_slashes: true`** normalizes the path before forwarding upstream. The app receives `/admin/config`.
+3. The app compares strictly: `urlsplit(self.path).path == "/admin/config"`. Match.
 
-The banner told us exactly where to look: "not every layer has been customized beyond its default configuration" — `merge_slashes` is Envoy's default. The controls prove the differential: interior double slashes (`/admin//config` → 403) merge *before* RBAC sees the path, while a *leading* `//` survives the RBAC match and only merges for the upstream. Dot-segment and percent-encoded variants all fail one layer or the other.
+The controls are what make the diagnosis and not a lucky guess: interior double slashes (`/admin//config` → 403) merge *before* RBAC sees the path, while a *leading* `//` survives the RBAC evaluation and only merges for the upstream. Dot-segment and percent-encoded variants fail at one layer or the other. And the banner had flagged the culprit in advance — "not every layer has been customized beyond its default configuration" is a precise description of Envoy shipping `merge_slashes` on by default.
 
-Both flags were first solves board-wide on this challenge, and the flag name confirms the intent: RBAC reads one path, the app another — two stories.
+### What the read-only scouts fenced off
 
-### What the scouts killed
+Two fifteen-minute scout runs closed the alternatives before the mutation owner spent anything on them: the kubelet was hardened (webhook authorization, 401/403 on every subresource, read-only port closed), and all sidecar admin/telemetry ports (15000/15006/15020/15021/15090) were Calico-dropped from the dev pod — `allow-tcp-8080` permits exactly one port. Both rabbit holes deleted at scout budget. That asymmetry — cheap read-only refutation protecting expensive mutation time — was the single most valuable mechanic of the whole run.
 
-Worth recording because negative results were load-bearing here: the kubelet on the node was hardened (webhook authorization, 401/403 on every subresource, read-only port closed), and all Istio sidecar admin/telemetry ports (15000/15006/15020/15021/15090) were Calico-dropped from the dev pod — the `allow-tcp-8080` policy permits exactly one port. Two read-only scouts fenced off both rabbit holes in fifteen minutes each, so the mutation owner's whole budget went to the variant sweep that actually won.
+## Case file 3 — do-not-spill-the-honey
 
-## Challenge 3 — do-not-spill-the-honey
-
-The third bundle is the big one (100 points across three flags) and the most atmospheric:
+The last bundle, worth 100 points across three flags, and the most atmospheric:
 
 ```text
           __         .' '.
@@ -326,25 +307,24 @@ message brokers. Take the challenge bravely, and let the Greeks'
 ancient order guide your work.
 ```
 
-Utah = the Beehive State, so: flags in a database ("tables among Utah's legends") and flags drifting through message brokers ("the Greeks' ancient order" = consume your topics alpha → beta → gamma). All three CTFd entries share one description: **"Hey! DNS the honey!"**
+Utah is the Beehive State; "tables among Utah's legends" is a database; "message brokers" and "the Greeks' ancient order" point at consuming broker topics in alphabetical order. All three CTFd entries share a single description: **"Hey! DNS the honey!"**
 
-You land as root on `jumppod` (`system:serviceaccount:default:jumppod`). The RBAC dump is strange on purpose:
+Landing identity: root on `jumppod`, service account `system:serviceaccount:default:jumppod`. The RBAC grant set is strange on purpose:
 
-- get pods / services / logs, cluster-wide reads on namespaces and CiliumNetworkPolicies
-- **delete pods in `ops` only** — nothing else, create nothing anywhere
-- **update/patch on MutatingAdmissionPolicies** — the odd grant. An existing `add-team-platform-label` policy stamps `team: platform` onto every pod CREATE.
+- get pods, services, and logs; cluster-wide read on namespaces and CiliumNetworkPolicies
+- **delete pods in `ops` only** — the only mutation touching workloads
+- **update/patch on MutatingAdmissionPolicies** — the genuinely odd grant; an existing `add-team-platform-label` policy stamps `team: platform` onto every pod CREATE
+- create verbs: none, anywhere
 
-Visible workloads: `db-bastion` (alpine, its own service account) and `postgres:18` in `ops` — the latter with `POSTGRES_HOST_AUTH_METHOD=trust` sitting right in the pod spec. Plus two "collector" deployments and a `queue-alpha` label that shows up as a source selector in policies.
+That "no creates anywhere" is the setup for the first flag's punchline.
 
-### Flag 1 — rbac audit prevents privilege escalation
+Workloads visible at landing: `db-bastion` (alpine, its own service account), `postgres:18` in `ops` with `POSTGRES_HOST_AUTH_METHOD=trust` sitting in the pod spec, two collector deployments, and a `queue-alpha` string that appears as a pod label in policy selectors.
 
-The postgres pod is "protected" by a narrow CiliumNetworkPolicy: `postgres-only-from-db-bastion`. But read **every** policy that selects the postgres endpoint, not just the one named after it. An ops-wide `deny-ops-egress` policy also selects postgres, and it admits ingress from namespace `default` on any port. Cilium **unions** the allow rules of all policies selecting an endpoint — the broad policy quietly nullifies the narrow one:
+### 19:31Z — the policy union nobody read
 
-```text
-jumppod (ns default) ──TCP 5432──▶ postgres.ops.svc.cluster.local   OPEN
-```
+The postgres pod wears a purpose-built narrow gate: `postgres-only-from-db-bastion`, exactly what it sounds like. But the rule for reading Cilium policy is to read *every* policy selecting the endpoint, not the one named after it. An ops-wide `deny-ops-egress` policy also selects postgres — and it admits ingress from namespace `default` on any port. Cilium **unions** the allow rules across all policies selecting an endpoint, so the broad policy quietly nullifies the narrow one. A TCP dial from the jumppod to 5432 confirmed it: open.
 
-Combine with `POSTGRES_HOST_AUTH_METHOD=trust` and the database is one command away, no credentials:
+Combine with trust auth and the database is one command away, no credentials involved:
 
 ```shell
 psql -h postgres.ops.svc.cluster.local -U postgres -d postgres -P pager=off \
@@ -361,92 +341,88 @@ psql -h postgres.ops.svc.cluster.local -U postgres -d postgres -P pager=off \
 (15 rows)
 ```
 
-`flag_ctf{rbac_audit_prevents_privilege_escalation}` — Wat Misaka, first non-white player in the NBA, Utah Sports Hall of Fame 1999. The flag text names the intended hard part: the RBAC grant set *looks* escalation-proof (no creates anywhere). The actual path was a network-policy union hole plus trust auth — nothing about RBAC at all.
+`flag_ctf{rbac_audit_prevents_privilege_escalation}`, hidden in the `note` column of Wat Misaka — first non-white player in the NBA, Utah Sports Hall of Fame 1999. And the flag text names the intended difficulty: the RBAC grant set *looks* escalation-proof. The hole wasn't in RBAC at all; it was a policy-union gap in the network layer plus an authentication mode that made network reachability the only gate.
 
-One operational lesson we earned here, worth the pixels: the first database sweep ran `pg_dump` with stderr discarded, and the pg_dump **v14 client silently aborts against a PG 18.6 server**. The empty grep *looked* like "no flags anywhere," including the flag we'd already found. It was caught by re-running with stderr visible and testing the tool against a known-positive first. **Trust no empty sweep without a positive control.**
+An operational note the log earned at this exact point: the first database sweep ran `pg_dump` with stderr discarded, and the pg_dump **v14 client silently aborts against a PG 18.6 server**. The empty grep looked like "no flags anywhere" — including the flag we had already found. It was caught by re-running with stderr visible and testing the tool against a known-positive first. Rule for the permanent collection: **trust no empty sweep without a positive control.**
 
-### Hey, DNS the honey
+### The map DNS handed over
 
-The remaining two flags live with the message brokers, and the challenge description says to use DNS. Here's the full map of what we established, because this is the part we didn't finish — and a good map of the negative space is still useful to anyone who did.
+With the database flag banked, the remaining two flags live with the brokers — and the challenge description says to use DNS. What DNS actually gives you on this cluster:
 
-**The DNS discovery technique.** CoreDNS answers PTR records for service-endpoint pod IPs — `<ip-with-dashes>.<svc>.<ns>.svc.cluster.local`. A sweep of the whole pod CIDR (172.20.0.0/16, all 65,536 addresses, batched `dig -x`) recovers the complete service map **with zero RBAC**:
+CoreDNS answers PTR records for service-endpoint pod IPs. A sweep of the entire pod CIDR (172.20.0.0/16 — all 65,536 addresses, batched `dig -x`) recovers the complete service map **with zero RBAC permissions**:
 
-- `collector-data-processing` (10.99.197.236 → pod 172.20.0.48:8080) — all ports dropped from our vantage; Cilium-gated
-- `collector-restricted` (10.102.146.251 → pod 172.20.0.39:8080) — reachable; an Express request-echo app
+- `collector-data-processing` (10.99.197.236) — all ports dropped from our vantage; Cilium-gated
+- `collector-restricted` (10.102.146.251) — reachable; an Express request-echo app
 - `postgres.ops` — banked above
 - `kube-dns` ×2
-- **`queue-alpha`: no DNS presence at all.** No Service, no headless service, nothing. A dictionary sweep of ~200 plausible names (broker names, Greek letters and gods, honey/bee words, Utah legends) returned all NXDOMAIN — the only naming convention that exists on this cluster is `<role>-<namespace>`.
+- **`queue-alpha`: no DNS presence at all.** No Service, no headless Service, nothing
 
-**The `pods insecure` trap.** CoreDNS's `pods insecure` mode (the distribution default) answers *any* `<ip>.<ns>.pod.cluster.local` query with the encoded IP without checking Kubernetes. Prove it before trusting any pod-form DNS result:
+A dictionary sweep of ~200 plausible names — broker products, Greek letters and gods, honey and bee words, Utah legends — returned all NXDOMAIN. The only naming convention that exists on the cluster is `<role>-<namespace>`. A PTR sweep of the service CIDR (exhaustive through 10.103.x and 55% beyond) inventoried every Service: `kubernetes`, `kube-dns`, `hubble-peer`, the two collectors, `postgres`. No broker Service anywhere. SRV, TXT, and AXFR (refused) added nothing.
+
+And one trap worth documenting: this CoreDNS runs `pods insecure` — it will answer *any* `<ip>.<ns>.pod.cluster.local` query with the encoded IP without checking Kubernetes. Prove it before trusting any pod-form DNS result:
 
 ```shell
 dig +short 8-8-8-8.kube-system.pod.cluster.local
 # 8.8.8.8      ← resolves = insecure mode = pod-form results prove nothing
 ```
 
-We caught this mid-run: a planned "does this pod exist" discriminator based on pod-form DNS would have false-confirmed pods in the network-policy drop zones. Negative controls must be *impossible* values, not just known-good ones.
+We caught this mid-run: a planned "does this pod exist" discriminator built on pod-form DNS would have false-confirmed pods inside the network-policy drop zones. Negative controls must be *impossible* values, not merely known-good ones.
 
-**The service CIDR is exhausted too.** A PTR sweep of the service CIDR (10.96.0.0/12, covered exhaustively through 10.103.x and 55% beyond) inventories every Service: `kubernetes`, `kube-dns`, `hubble-peer` (standard Cilium), the two collectors, `postgres`. **No broker Service exists anywhere covered.** SRV, TXT, AXFR (refused), themed zones — all empty.
+### The thing the challenge name warned about
 
-**The honeypot.** `collector-restricted` is the "do-not-spill-the-honey" warning made flesh. Thirteen probes — every route shape, methods, header and body variations, queue-themed payloads, HTTP/2, absolute-form targets — all return the identical 200 echo of the request, ~20ms, no storage, no auth, no SSRF, no fetch. It's a passive request-capture decoy: the exposed twin of the real, Cilium-gated `collector-data-processing`. Feed it nothing. (Amusing detail: Express `trust proxy` is on, so anything keying on `req.ip` behind it is `X-Forwarded-For`-spoofable — but no gate keys on it. It just wants to watch.)
+`collector-restricted` is the "do-not-spill-the-honey" warning made flesh. Thirteen probes — every route shape, methods, header and body variations, queue-themed payloads, HTTP/2 prior knowledge, absolute-form targets — returned the identical 200 echo of the request, ~20ms, with no storage, no auth, no fetch, no SSRF anywhere in reach. Verdict: a passive request-capture decoy, the exposed twin of the real, Cilium-gated `collector-data-processing`. The instruction is in the challenge's name — don't feed it. (A detail for the file: Express `trust proxy` is enabled, so `req.ip` behind it is `X-Forwarded-For`-spoofable. Nothing keys on it. It just wants to watch.)
 
-### Where we ran out of clock
+### 20:33Z — where the clock won
 
-The broker flags require finding pods that are invisible to RBAC (can't list pods in their namespace), invisible to DNS (no Service), and possibly invisible to nmap (policy drop zones). What we established before the window closed:
+The log's last entry is a policy revert. What it holds when it ends:
 
-- **Kubelets are hardened** on all three nodes — 401 anonymous, 403 with our SA on every metadata subresource, path-normalization tricks all fail, read-only port closed. The NA 2025-era `nodes/proxy` → kubelet-exec recipe is dead on this build.
-- **Node inventory via kubelet TLS certificate CNs** — you don't need auth to read a cert's subject. Three nodes, one /24 of pod CIDR each, which proves the pod CIDR beyond 172.20.2.x is *empty* — an entire class of "keep scanning the /16" effort deleted.
-- **etcd is network-reachable from the jumppod** (the same policy-union gap reaches the control plane) on master-1:2379 — but demands a client certificate from a standalone `etcd-ca`. If any identity escalation surfaces an etcd client cert, it converts directly into full cluster state, hidden pods included. We never found one. That was the single highest-value door left standing.
-- **Postgres is conclusively not the broker** — `pg_stat_activity` shows zero application clients, no NOTIFY traffic on any plausible channel, no cron/amqp/replication extensions.
-- **Cilium operator metrics** (node-2:9963) are unauthenticated and dump 900 lines of workqueue counters — nothing flag-shaped.
-- **The house-style bet.** ControlPlane's pattern (documented in the NA 2024 write-ups) is that the intended solve is *the one write permission you hold*. Ours was update/patch on MutatingAdmissionPolicies plus delete-pods-in-`ops`: patch the `add-team-platform-label` MAP to inject a command into the *recreated* `db-bastion` pod, delete the pod, read the output from logs — a poor man's exec under someone else's service account. We used it to run SelfSubjectAccessReviews as the `db-bastion` identity (can it delete/patch/create pods in `data-processing`, list pods in `restricted`, read secrets?). The policy was reverted and the mutated pod cleaned up afterward. The identity question was still open when the clock ran out.
-- **Full-port scans** of every live pod IP found exactly one nonstandard open port: 4240 on 172.20.0.107 — which is cilium-health. Not the broker.
+- **kubelets are hardened** on all three nodes — 401 anonymous, 403 under our service account on every metadata subresource, path-normalization tricks all fail, read-only port closed
+- **node inventory via kubelet TLS certificate CNs** — reading a cert's subject needs no authentication. Three nodes, one pod-CIDR /24 each — which proves everything beyond 172.20.2.x is empty and deletes an entire class of "keep scanning the /16" effort
+- **etcd on master-1:2379 is reachable from the jumppod** — the same policy-union gap extends to the control plane — but demands a client certificate from a standalone `etcd-ca`. Full cluster state behind one mTLS handshake we couldn't complete. The highest-value door left standing
+- **postgres is conclusively not the broker** — zero application clients in `pg_stat_activity`, no NOTIFY traffic on 27 plausible channels, no cron/amqp/replication machinery
+- **Cilium operator metrics** (node-2:9963) are unauthenticated — 900 lines of workqueue counters, nothing flag-shaped
+- **the house-style bet, played and unfinished:** ControlPlane's recurring pattern is that the intended solve is *the one write permission you hold*. Ours were update/patch on MutatingAdmissionPolicies and delete-pods-in-`ops`. The play: patch the `add-team-platform-label` MAP to inject a command into the *recreated* `db-bastion` pod, delete the pod, read the output from logs — a poor man's exec under another service account. We used it to run SelfSubjectAccessReviews as the `db-bastion` identity: can it delete, patch, or create pods in `data-processing`? List pods in `restricted`? Read secrets? The policy was reverted and the mutated pod cleaned up before close. The identity question was still open when the window ended
+- **full-port scans of every live pod IP** found exactly one nonstandard open port: 4240 on 172.20.0.107, which is cilium-health
 
-Our best remaining theory when the window closed: the `queue-alpha` pods sit behind an **unreadable CiliumClusterwideNetworkPolicy** (the RBAC asymmetry is deliberate — namespaced CNPs are readable, clusterwide ones are not), reachable only from a `data-processing`-namespace identity, which is what the db-bastion hijack was probing toward. Flags 7 and 8 stayed unsold on our ledger. If you took them, this write-up is as much for you as from you.
+Best remaining theory, recorded as a theory: the `queue-alpha` pods sit behind an **unreadable CiliumClusterwideNetworkPolicy** — the RBAC asymmetry is deliberate, namespaced CNPs readable, clusterwide ones not — reachable only from a `data-processing` identity. Which is precisely what the db-bastion hijack was reaching for when time expired. If you finished those two flags: well played, and I'd genuinely like to know how it ends.
 
-## How this was actually run
+## How the swarm ran it
 
-The part that made this run different: no human typed the commands above. I supervised an **agent swarm** — one orchestrator/judge session (me, mostly reading) and fresh-context LLM workers (an open-weights model, served locally) dispatched in waves through an agent orchestration layer. The design came from our SOC research work, adapted from a hypothesis-testing swarm pattern; this CTF was its greenfield shakedown.
+No human typed the commands above. The run was executed by an agent swarm — an orchestrator/judge session and fresh-context workers (an open-weights model served locally), dispatched in waves through an agent orchestration layer — with me supervising and steering. This was a shakedown of a pattern we use for SOC hypothesis work, applied to a CTF for the first time.
 
-The setup:
+The pieces that mattered:
 
-- **A pattern pre-brief.** Before the event, we distilled four KubeCons' worth of public write-ups (Skybound's NA 2024 → EU 2026 series) plus Iain Smart's account of his solo Claude attempt at EU 2026 into a single pre-brief every worker reads: the universal opening (banner, home directory, `whoami`, per-namespace `can-i`, `api-resources`, enumerate everything `-o yaml`), a menu of misconfiguration families, where flags physically hide, and the known-hard techniques. Workers started from priors instead of rediscovering them under the clock.
-- **Roles.** One **primary** per challenge owns all mutations. **Scouts** are read-only, one hypothesis family each, 15-minute hard budget. When the hunt stalled, dedicated **critic** agents got falsification assignments with per-hypothesis verdict deliverables. The orchestrator never hunts directly — it decomposes, dispatches, and judges.
-- **An evidence contract.** Every command's raw output streams to timestamped log files in per-worker directories. The judge grades files, not summaries. A flag only counts when its exact string appears verbatim in a raw evidence capture, and verified flags go to CTFd immediately — no batching.
-- **Refute-first judging.** Every return gets "what would make this wrong?" before "what did it find?" Failed scopes read as clean negatives, decoy credentials, stale state, wrong namespace. Dead ends are recorded as coverage so later waves don't re-hunt them.
+- **A pattern pre-brief.** Before the event, four KubeCons' worth of public write-ups — Skybound's NA 2024 through EU 2026 series, and Iain Smart's account of a solo Claude attempt at EU 2026 — were distilled into a single pre-brief every worker read before acting: the universal opening moves (banner, home directory, `whoami`, per-namespace `can-i`, `api-resources`, enumerate everything `-o yaml`), a menu of misconfiguration families, where flags physically hide, and the known-hard techniques. Workers started from priors instead of rediscovering them under the clock. Crediting those sources here isn't courtesy — the pre-brief is built out of them.
+- **Roles.** One **primary** per challenge owned all mutations. **Scouts** were read-only, one hypothesis family each, fifteen-minute hard budget. When the hunt stalled, dedicated **critics** got falsification assignments with per-hypothesis verdict deliverables. The orchestrator never hunted directly.
+- **An evidence contract.** Every command's raw output streamed to timestamped files in per-worker directories. The judge graded files, not summaries. A flag counted only when its exact string appeared verbatim in a raw capture, and verified flags went to CTFd immediately.
+- **Refute-first judging.** Every return was interrogated before it was believed: what would make this wrong — failed scopes reading as clean negatives, decoy credentials, stale state, wrong namespace? Dead ends were recorded as coverage so later waves never re-hunted them.
 
-How it held up:
+Performance, from the log: challenge 1 ran landing-to-complete in ~35 minutes (including a twenty-minute fight with the SSH wrapper, below); both challenge 2 flags were first solves board-wide; the honey database flag banked ~8 minutes after its wave dispatched. The dead-end recovery loop earned its keep three times over — read-only scouts killed the kubelet theory, the sidecar-port theory, and the honeypot temptation before any mutation owner touched them.
 
-- Challenge 1 went recon-to-complete in ~35 minutes, including a twenty-minute fight with the SSH login wrapper (below).
-- Challenge 2's both flags were first solves board-wide; the orchestrator took flag 1 as an opening probe, a worker won flag 2 with the variant sweep.
-- Challenge 3's database flag landed ~8 minutes after the wave dispatched. The broker hunt then consumed the rest of the window honestly.
-- The dead-end recovery loop worked as designed, repeatedly: read-only scouts killed the kubelet theory, the sidecar-port theory, and the honeypot temptation before any mutation owner burned budget on them. Negative results fenced the search space — that was the scouts' whole job.
-- The judge was wrong exactly once, instructively: armchair analysis predicted `//admin/config` would 404 (reasoning that Python's `urlsplit` would treat the leading `//` as a netloc). The empirical 26-variant sweep won anyway. When you can afford the sweep, sweep — model the mechanism afterward, from the observation.
+The judge was wrong exactly once, and it's the most instructive line in the log: armchair analysis predicted `//admin/config` would return 404, reasoning that Python's `urlsplit` would treat the leading `//` as a netloc separator. The model was right about `urlsplit` and wrong about everything else — it never occurred to the analysis that Envoy rewrites the path before the app sees it. The empirical 26-variant sweep won anyway because it was dispatched as a sweep, not as a bet on one analysis. When you can afford the sweep, sweep; derive the mechanism afterward, from the observation.
 
-Gotchas we hit that are worth stealing regardless of how you play:
+Gotchas from the run, useful to anyone regardless of how they play:
 
-1. **The bastion login wrapper demands a pty, remotely.** Plain `ssh bastion 'cmd'` prints the banner and runs *nothing* — the remote-side wrapper needs a TTY and exits 0 silently. `ssh -T` doesn't help because the demand is remote. The fix is a local pty: `printf 'cmd\nexit\n' | script -q /dev/null ssh ...`. Iain Smart's write-up hit the same wall config-side; this is the remote-side variant.
-2. **CTFd API token auth requires `Content-Type: application/json`.** An `Accept` header alone leaves your `Authorization` token silently ignored and every API path 302s to `/login`. This cost us ~20 minutes and was nearly misdiagnosed as a bad token.
-3. **A `~/.curlrc` with `--location` turns those 302s into fake 200s** (the login page renders as success). Use `curl -q` or a no-redirect client when debugging HTTP auth.
-4. **Cost-0 hints are free intel.** Unlock every free hint immediately; the paid ones we left untouched (55 points' worth) as a matter of policy.
-5. **The scoreboard and per-user solves endpoints are public pre-auth** — full board state, first-solve attribution, and challenge reconstruction are available without a token.
-6. **Environments rotate per bundle.** Each challenge is a fresh cluster on a new bastion; check the banner and creationTimestamps before attributing probe results to a challenge.
+1. **The bastion login wrapper demands a pty, remotely.** Plain `ssh bastion 'cmd'` prints the banner and runs *nothing* — the remote wrapper needs a TTY and exits 0 silently. `ssh -T` doesn't help; the demand is remote-side. Fix: `printf 'cmd\nexit\n' | script -q /dev/null ssh ...` for a local pty.
+2. **CTFd's API token auth only engages with `Content-Type: application/json`.** An `Accept` header alone leaves the `Authorization` token silently ignored; every API path 302s to `/login`. Nearly misdiagnosed as a bad token.
+3. **A `~/.curlrc` containing `--location`** turns those 302s into fake 200s — the login page renders as success. `curl -q` or a no-redirect client when debugging HTTP auth.
+4. **Cost-0 hints are free intel.** Unlock every free hint immediately; the paid ones went unbought on policy.
+5. **The scoreboard and per-user solves endpoints are public pre-auth** — full board state and first-solve attribution without a token.
+6. **Environments rotate per bundle.** Each challenge is a fresh cluster behind a new bastion; check the banner and creationTimestamps before attributing probe results to a challenge.
 
-## Conclusions
+## What we'd tell a defender
 
-Six of eight flags, 130 points, #1 at the last board pull, both second-challenge flags first-solves board-wide, and one honest miss on the broker. Some closing thoughts for defenders, since that's the other reason these CTFs exist:
+The CTF is the toy version of a real audit method. The takeaways, in the order they'd bite you:
 
-- **The one write permission you hold is the intended solve.** Every ControlPlane challenge we've touched follows this: `httproutes`+`referencegrants` split across two namespaces; `patch namespace/dev`; `update MutatingAdmissionPolicies` + `delete pods in ops`. Audit your RBAC by asking "what's the worst chain that starts from exactly this verb, on exactly this resourceNames scope" — not "is this role dangerous in isolation."
-- **A network policy that trusts a self-servable label is decorative.** If the tenant can set the label (`patch namespaces` on their own namespace), the gate is theirs to open. Same family: trust anchors in pod labels tenants can choose.
-- **Normalization differentials break L7 policy.** Any authz layer that prefix-matches the raw path, fronting a proxy that normalizes before the app, has a gap. Leading-`//` with `--path-as-is` is the canonical probe; interior `//` merging pre-RBAC vs. leading `//` merging post-RBAC was the whole challenge. If you run Istio/Envoy in front of strict-matching apps, sweep your own gates this way.
-- **Policy engines that union allows can be nullified by their broadest policy.** Cilium unions the allow rules of every policy selecting an endpoint — an ops-wide "deny egress" that quietly admits one namespace defeated a purpose-built `postgres-only-from-db-bastion`. Read all policies selecting a target, not the one named after it.
-- **`POSTGRES_HOST_AUTH_METHOD=trust` makes network policy the only gate.** That's a fine design if the network policy is actually sound — see above for how that went.
-- **DNS is an RBAC-free recon channel.** CoreDNS PTR sweeps recover the service map without a single list permission, and `pods insecure` mints arbitrary A records for anyone who knows the encoding. For a hardened cluster, that's an information leak worth closing.
+- **Audit RBAC by chain, not by role.** Every challenge's intended solve started from the one write verb the player held: `httproutes`+`referencegrants` split across two namespaces; `patch namespace/dev`; `update MutatingAdmissionPolicies` plus `delete pods in ops`. The right review question is "what's the worst chain that starts from exactly this verb, on exactly this `resourceNames` scope."
+- **A policy keyed on a self-servable label is decorative.** If the tenant can set the trust anchor — their own namespace's labels — the gate belongs to them.
+- **Normalization differentials break L7 policy.** An authz layer matching the raw path in front of a proxy that normalizes before the app has a gap between them; leading-`//` with `--path-as-is` is the canonical probe. Interior-`//` merging pre-RBAC versus leading-`//` merging post-RBAC was an entire flag.
+- **Policy engines that union allows can be nullified by their broadest policy.** Cilium unions the allow rules of every policy selecting an endpoint — an ops-wide rule that quietly admits one namespace defeated a purpose-built postgres gate. Read all policies selecting a target, not the one named after it.
+- **`POSTGRES_HOST_AUTH_METHOD=trust` makes network policy the only gate.** Acceptable only if that policy is actually sound — see above for how that went.
+- **DNS is an RBAC-free recon channel.** PTR sweeps recover the service map with zero permissions, and `pods insecure` mints arbitrary A records for anyone who knows the encoding. Treat cluster DNS as exposed inventory.
 
-Thanks to ControlPlane for another excellent set — the honey challenge in particular is the best-designed piece of negative space we've played. If you finished the broker flags, I'd genuinely love to compare notes.
-
-Further reading that seeded our pre-brief and is worth your time:
+## Sources
 
 - [ControlPlane CTF setup](https://ctf.control-plane.io/setup/)
-- [Skybound's KubeCon CTF write-ups](https://www.skybound.link/) (NA 2024 → EU 2026 — the pattern inventory)
-- [Iain Smart, "KubeCon CTF: The Human Viewpoint"](https://blog.iainsmart.co.uk/posts/2026-03-25-claudes-ctf-experience/) (a solo Claude attempt at EU 2026)
+- [Skybound's KubeCon CTF write-ups](https://www.skybound.link/) — NA 2024 through EU 2026; the raw material for our workers' pre-brief
+- [Iain Smart, "KubeCon CTF: The Human Viewpoint"](https://blog.iainsmart.co.uk/posts/2026-03-25-claudes-ctf-experience/) — a solo Claude attempt at EU 2026

@@ -23,6 +23,8 @@ toc: true
 
 Push to `main`; the Pages workflow builds and deploys.
 
+**Voice conventions:** write in our own voice and structure — our facts, commands, and outputs are ours to publish, but borrowed framing, signature phrasings, and post skeletons from other people's write-ups are not. When a post builds on someone else's analysis patterns, say so in a Sources section and link them.
+
 ## Building locally
 
 ```shell
